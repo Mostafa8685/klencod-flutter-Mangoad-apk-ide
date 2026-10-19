@@ -1,0 +1,94 @@
+# Lives in the DEDICATED, PRIVATE build repository. Holds no secrets.
+# User code runs only inside this ephemeral runner and never sees backend credentials.
+name: build-android
+run-name: build ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:       { description: Job ID, required: true, type: string }
+      source_url:   { description: Signed source URL, required: true, type: string }
+      icon_url:     { description: Signed icon URL (optional), required: false, type: string, default: '' }
+      app_name:     { required: true, type: string }
+      package_name: { required: true, type: string }
+      version_name: { required: true, type: string }
+      version_code: { required: true, type: string }
+      build_type:   { required: true, type: string }
+      output_name:  { required: true, type: string }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # Inputs go through env, never interpolated into shell scripts (prevents injection).
+      JOB_ID: ${{ inputs.job_id }}
+      SOURCE_URL: ${{ inputs.source_url }}
+      ICON_URL: ${{ inputs.icon_url }}
+      APP_NAME: ${{ inputs.app_name }}
+      PACKAGE_NAME: ${{ inputs.package_name }}
+      VERSION_NAME: ${{ inputs.version_name }}
+      VERSION_CODE: ${{ inputs.version_code }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      OUTPUT_NAME: ${{ inputs.output_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download source
+        run: |
+          mkdir -p "$RUNNER_TEMP/in"
+          curl -fsSL --max-time 300 --max-filesize 524288000 "$SOURCE_URL" -o "$RUNNER_TEMP/in/source.zip"
+          if [ -n "$ICON_URL" ]; then curl -fsSL --max-time 60 --max-filesize 5242880 "$ICON_URL" -o "$RUNNER_TEMP/in/icon.img"; fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Validate and prepare
+        id: prep
+        run: python3 -m pip install --quiet pillow && python3 .github/scripts/prepare.py
+
+      - uses: subosito/flutter-action@v2
+        if: steps.prep.outputs.project_type == 'flutter'
+        with:
+          channel: stable
+
+      - name: Install dependencies
+        working-directory: ${{ steps.prep.outputs.project_dir }}
+        run: |
+          if [ "${{ steps.prep.outputs.project_type }}" = "flutter" ]; then
+            flutter pub get
+          else
+            chmod +x ./gradlew && ./gradlew --no-daemon --console=plain help
+          fi
+
+      - name: Build APK
+        working-directory: ${{ steps.prep.outputs.project_dir }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          if [ "${{ steps.prep.outputs.project_type }}" = "flutter" ]; then
+            flutter build apk "--$BUILD_TYPE"
+            cp build/app/outputs/flutter-apk/app-"$BUILD_TYPE".apk "$GITHUB_WORKSPACE/dist/$OUTPUT_NAME"
+          else
+            ./gradlew --no-daemon --console=plain assembleDebug
+            APK=$(find . -path '*build/outputs/apk/debug/*.apk' | head -n1)
+            test -n "$APK" && cp "$APK" "$GITHUB_WORKSPACE/dist/$OUTPUT_NAME"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 1
